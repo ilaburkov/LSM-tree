@@ -69,11 +69,28 @@ class DiskComponent:
 
     def range(self, start, end):
         res = []
-        for idx in range(self.num_keys):
+        l, r = 0, self.num_keys - 1
+        first = self.num_keys
+        while l <= r:
+            m = (l + r) // 2
+            offset = self._get_offset(m)
+            k, _ = self._read_key_value(offset)
+            if k < start:
+                l = m + 1
+            else:
+                first = m
+                r = m - 1
+        idx = first
+        while idx < self.num_keys:
             offset = self._get_offset(idx)
             k, value = self._read_key_value(offset)
-            if start <= k <= end:
-                res.append((k, value))
+            if k > end:
+                break
+            if k < start:
+                idx += 1
+                continue
+            res.append((k, value))
+            idx += 1
         return res
 
     def close(self):
