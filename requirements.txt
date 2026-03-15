@@ -1,0 +1,5 @@
+sortedcontainers
+pyroaring
+nltk
+pytest
+pytest-asyncio

@@ -2,14 +2,18 @@ from sortedcontainers import SortedDict
 import threading
 
 class Memtable:
-    def __init__(self, max_size):
+    def __init__(self, max_size, merge_fn=None):
         self.data = SortedDict()
         self.max_size = max_size
         self.lock = threading.Lock()
+        self.merge_fn = merge_fn
 
     def put(self, key: str, value: str):
         with self.lock:
-            self.data[key] = value
+            if self.merge_fn and key in self.data:
+                self.data[key] = self.merge_fn(self.data[key], value)
+            else:
+                self.data[key] = value
             return len(self.data) >= self.max_size
 
     def get(self, key: str):

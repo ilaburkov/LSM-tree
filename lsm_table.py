@@ -35,7 +35,6 @@ class LsmTable:
             await self._maybe_merge(next_level)
 
     async def _merge_components(self, components, out_path):
-        
         iters = [comp.iter_items() for comp in components]
         heap = []
         for idx, it in enumerate(iters):
@@ -51,36 +50,44 @@ class LsmTable:
         data_file = open(data_path, 'wb')
         offset = 0
         bloom_keys = []
-        last_key = None
         num_keys = 0
-        while heap:
-            k, idx, v = heapq.heappop(heap)
-            if k == 'a':
-                print(f"Processing key: {k}, value: {v}, from component index: {idx}, last_key: {last_key}, file: {out_path}")
-            if last_key == k:
-                try:
-                    k2, v2 = next(iters[idx])
-                    heapq.heappush(heap, (k2, idx, v2))
-                except StopIteration:
-                    pass
-                continue
-            k_bytes = k.encode('utf-8')
-            v_bytes = v.encode('utf-8')
+
+        last_key = None
+        last_value = None
+
+        def _write_buffered():
+            nonlocal offset, num_keys
+            k_bytes = last_key.encode('utf-8')
+            v_bytes = last_value.encode('utf-8')
             chunk = (
                 struct.pack('I', len(k_bytes)) + k_bytes +
                 struct.pack('I', len(v_bytes)) + v_bytes
             )
             offsets_file.write(struct.pack('Q', offset))
             data_file.write(chunk)
-            bloom_keys.append(k)
-            last_key = k
+            bloom_keys.append(last_key)
             num_keys += 1
+            offset += len(chunk)
+
+        while heap:
+            k, idx, v = heapq.heappop(heap)
+            if k == last_key:
+                if self.merge_fn:
+                    last_value = self.merge_fn(last_value, v)
+            else:
+                if last_key is not None:
+                    _write_buffered()
+                last_key = k
+                last_value = v
             try:
                 k2, v2 = next(iters[idx])
                 heapq.heappush(heap, (k2, idx, v2))
             except StopIteration:
                 pass
-            offset += len(chunk)
+
+        if last_key is not None:
+            _write_buffered()
+
         offsets_file.close()
         data_file.close()
         bloom_size, num_hashes = BloomFilter.optimal_size(num_keys, 0.01)
@@ -104,11 +111,12 @@ class LsmTable:
         os.remove(offsets_path)
         os.remove(data_path)
         
-    def __init__(self, directory, r=10, l=1000):
+    def __init__(self, directory, r=10, l=1000, merge_fn=None):
         self.directory = directory
         self.r = r 
         self.l = l
-        self.memtable = Memtable(l)
+        self.merge_fn = merge_fn
+        self.memtable = Memtable(l, merge_fn=merge_fn)
         self.levels = []
         self.locks = []
         self._init_storage()
@@ -141,6 +149,18 @@ class LsmTable:
         await self.insert(key, '<DELETED>')
 
     async def get(self, key: str):
+        if self.merge_fn:
+            result = None
+            val = self.memtable.get(key)
+            if val is not None:
+                result = val
+            for level, comps in enumerate(self.levels):
+                async with self.locks[level]:
+                    for comp in comps:
+                        v = comp.get(key)
+                        if v is not None:
+                            result = self.merge_fn(result, v) if result else v
+            return result
         val = self.memtable.get(key)
         if val is not None:
             if val == '<DELETED>':
