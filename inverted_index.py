@@ -1,12 +1,17 @@
 import os
 import re
+import json
 import base64
 import fnmatch
 
 from pyroaring import BitMap
 
 from lsm_table import LsmTable
-from text_processor import process as process_text, process_with_original
+from text_processor import (
+    process as process_text,
+    process_with_original,
+    process_with_positions,
+)
 
 
 def _encode_bitmap(bm: BitMap) -> str:
@@ -24,6 +29,17 @@ def _bitmap_merge(a: str, b: str) -> str:
 def _pairs_merge(a: str, b: str) -> str:
     pairs = set(a.split('\n')) | set(b.split('\n'))
     return '\n'.join(sorted(pairs))
+
+
+def _positions_merge(a: str, b: str) -> str:
+    da = json.loads(a)
+    db = json.loads(b)
+    for doc_id, positions in db.items():
+        if doc_id in da:
+            da[doc_id] = sorted(set(da[doc_id]) | set(positions))
+        else:
+            da[doc_id] = positions
+    return json.dumps(da, separators=(',', ':'))
 
 
 def _generate_ngrams(term: str) -> list[str]:
@@ -67,16 +83,21 @@ def _bsi_range_between(slices: list[BitMap], universe: BitMap,
 
 
 _QUERY_TOKEN_RE = re.compile(
-    r'\s*(AND|OR|NOT|[()])\s*|\s*(\w+)\s*', re.UNICODE | re.IGNORECASE
+    r'\s*"([^"]+)"\s*|\s*(AND|OR|NOT|[()])\s*|\s*(\w+)\s*',
+    re.UNICODE | re.IGNORECASE,
 )
 
 
 def _tokenize_query(query: str) -> list[str]:
     tokens: list[str] = []
     for m in _QUERY_TOKEN_RE.finditer(query):
-        tok = (m.group(1) or m.group(2))
-        if tok is not None:
-            tokens.append(tok)
+        phrase = m.group(1)
+        if phrase is not None:
+            tokens.append(f'"{phrase}"')
+        else:
+            tok = m.group(2) or m.group(3)
+            if tok is not None:
+                tokens.append(tok)
     return tokens
 
 
@@ -99,6 +120,11 @@ class _BinOpNode(_QueryNode):
         self.op = op
         self.left = left
         self.right = right
+
+
+class _PhraseNode(_QueryNode):
+    def __init__(self, phrase: str):
+        self.phrase = phrase
 
 
 class _DateRangeNode(_QueryNode):
@@ -148,6 +174,8 @@ class QueryParser:
                 self._consume()
             return node
         word = self._consume()
+        if word.startswith('"') and word.endswith('"'):
+            return _PhraseNode(word[1:-1])
         upper = word.upper()
         if upper in ('VALID', 'APPEARED') and self._peek() == '(':
             self._consume()
@@ -160,7 +188,6 @@ class QueryParser:
         stem = stems[0] if stems else word.lower()
         return _TermNode(stem)
 
-
 class InvertedIndex:
     def __init__(self, directory: str, r: int = 10, l: int = 1000):
         self.directory = directory
@@ -169,6 +196,8 @@ class InvertedIndex:
         self.kgram_lsm = LsmTable(kgram_dir, r=r, l=l, merge_fn=_pairs_merge)
         bsi_dir = os.path.join(directory, 'bsi')
         self.bsi_lsm = LsmTable(bsi_dir, r=r, l=l, merge_fn=_bitmap_merge)
+        pos_dir = os.path.join(directory, 'pos')
+        self.pos_lsm = LsmTable(pos_dir, r=r, l=l, merge_fn=_positions_merge)
         self.all_docs = BitMap()
         self._load_all_docs()
 
@@ -187,7 +216,8 @@ class InvertedIndex:
 
     async def add_document(self, doc_id: int, text: str,
                            start_date: int | None = None,
-                           end_date: int | None = None):
+                           end_date: int | None = None,
+                           _pos_offset: int = 0) -> int:
         self.all_docs.add(doc_id)
         pairs = process_with_original(text)
         seen_stems: set[str] = set()
@@ -201,10 +231,19 @@ class InvertedIndex:
                 seen_words.add(original)
                 for ngram in _generate_ngrams(original):
                     await self.kgram_lsm.insert(ngram, f"{original}\t{doc_id}")
+        terms_with_pos, new_offset = process_with_positions(text, _pos_offset)
+        stem_positions: dict[str, list[int]] = {}
+        for stem, pos in terms_with_pos:
+            stem_positions.setdefault(stem, []).append(pos)
+        doc_key = str(doc_id)
+        for stem, positions in stem_positions.items():
+            pos_data = json.dumps({doc_key: positions}, separators=(',', ':'))
+            await self.pos_lsm.insert(stem, pos_data)
         if start_date is not None:
             await self._index_bsi(doc_id, "start", start_date)
         if end_date is not None:
             await self._index_bsi(doc_id, "end", end_date)
+        return new_offset
 
     async def _index_bsi(self, doc_id: int, prefix: str, value: int):
         encoded = _encode_bitmap(BitMap([doc_id]))
@@ -221,9 +260,10 @@ class InvertedIndex:
         if end_date is not None:
             await self._index_bsi(doc_id, "end", end_date)
         self.all_docs.add(doc_id)
+        offset = 0
         with open(path, 'r', encoding='utf-8') as f:
             for line in f:
-                await self.add_document(doc_id, line)
+                offset = await self.add_document(doc_id, line, _pos_offset=offset)
 
     async def get_posting(self, term: str) -> BitMap:
         val = await self.lsm.get(term)
@@ -251,6 +291,8 @@ class InvertedIndex:
             if node.op == 'AND':
                 return left & right
             return left | right
+        if isinstance(node, _PhraseNode):
+            return await self._phrase_bitmap(node.phrase)
         if isinstance(node, _DateRangeNode):
             if node.kind == 'VALID':
                 return await self._valid_bitmap(node.date_from, node.date_to)
@@ -296,6 +338,39 @@ class InvertedIndex:
     async def search_appeared(self, date_from: int, date_to: int) -> list[int]:
         return sorted(await self._appeared_bitmap(date_from, date_to))
 
+    async def _phrase_bitmap(self, phrase: str) -> BitMap:
+        terms_with_pos, _ = process_with_positions(phrase)
+        if not terms_with_pos:
+            return BitMap()
+        if len(terms_with_pos) == 1:
+            return await self.get_posting(terms_with_pos[0][0])
+        postings: list[dict[str, list[int]]] = []
+        for stem, _ in terms_with_pos:
+            val = await self.pos_lsm.get(stem)
+            if val is None:
+                return BitMap()
+            postings.append(json.loads(val))
+        common_docs = set(postings[0].keys())
+        for p in postings[1:]:
+            common_docs &= set(p.keys())
+        if not common_docs:
+            return BitMap()
+        offsets = [tp[1] - terms_with_pos[0][1] for tp in terms_with_pos]
+        result = BitMap()
+        for doc_id in common_docs:
+            first_positions = postings[0][doc_id]
+            for p in first_positions:
+                if all(
+                    (p + offsets[i]) in set(postings[i][doc_id])
+                    for i in range(1, len(terms_with_pos))
+                ):
+                    result.add(int(doc_id))
+                    break
+        return result
+
+    async def phrase_search(self, phrase: str) -> list[int]:
+        return sorted(await self._phrase_bitmap(phrase))
+
     async def wildcard_search(self, pattern: str) -> list[tuple[str, int]]:
         pattern = pattern.lower()
         segments = pattern.split('*')
@@ -311,7 +386,6 @@ class InvertedIndex:
 
         if not ngrams:
             return []
-
         candidates: set[str] | None = None
         for ng in ngrams:
             val = await self.kgram_lsm.get(ng)
@@ -339,4 +413,5 @@ class InvertedIndex:
         await self.lsm.flush()
         await self.kgram_lsm.flush()
         await self.bsi_lsm.flush()
+        await self.pos_lsm.flush()
         self._save_all_docs()
